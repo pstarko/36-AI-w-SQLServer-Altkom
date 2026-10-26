@@ -1,0 +1,185 @@
+/* =====================================================================
+   ZapytajAI – jedna procedura dla dwóch dostawców: Claude i OpenAI
+   Wymaga: SQL Server 2025 / Azure SQL (sp_invoke_external_rest_endpoint)
+   ===================================================================== */
+
+/* ---------------------------------------------------------------------
+   1. Konfiguracja (jednorazowo)
+   --------------------------------------------------------------------- */
+EXECUTE sp_configure 'external rest endpoint enabled', 1;
+RECONFIGURE WITH OVERRIDE;
+GO
+
+-- Jeśli baza nie ma jeszcze master key:
+-- CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'SilneHasloDoMasterKey!123';
+-- GO
+
+-- Claude: klucz w nagłówku x-api-key
+CREATE DATABASE SCOPED CREDENTIAL [https://api.anthropic.com]
+WITH IDENTITY = 'HTTPEndpointHeaders',
+     SECRET   = '{"x-api-key":"sk-ant-TWOJ_KLUCZ"}';
+GO
+
+-- OpenAI: klucz w nagłówku Authorization: Bearer
+CREATE DATABASE SCOPED CREDENTIAL [https://api.openai.com]
+WITH IDENTITY = 'HTTPEndpointHeaders',
+     SECRET   = '{"Authorization":"Bearer sk-proj-TWOJ_KLUCZ"}';
+GO
+
+-- Uprawnienie dla użytkownika, który będzie wywoływał procedurę:
+-- GRANT EXECUTE ANY EXTERNAL ENDPOINT TO [uzytkownik];
+-- GO
+
+/* ---------------------------------------------------------------------
+   2. Tabela
+   --------------------------------------------------------------------- */
+CREATE TABLE dbo.AIPytania
+(
+    Id              int IDENTITY PRIMARY KEY,
+    Dostawca        varchar(20)   NOT NULL,
+    Model           nvarchar(100) NOT NULL,
+    Pytanie         nvarchar(max) NOT NULL,
+    Odpowiedz       nvarchar(max) NULL,
+    DataPytania     datetime2     NOT NULL DEFAULT sysdatetime(),
+    DataOdpowiedzi  datetime2     NULL,
+    CzasMs          int           NULL,
+    KodHttp         int           NULL,
+    Blad            nvarchar(max) NULL,
+    SurowaOdpowiedz nvarchar(max) NULL   -- pełny JSON, przydatny do analizy na zajęciach
+);
+GO
+
+/* ---------------------------------------------------------------------
+   3. Procedura
+   --------------------------------------------------------------------- */
+CREATE OR ALTER PROCEDURE dbo.ZapytajAI
+    @Pytanie   nvarchar(max),
+    @Dostawca  varchar(20)   = 'claude',     -- 'claude' albo 'openai'
+    @Model     nvarchar(100) = NULL,         -- NULL = model domyślny dostawcy
+    @MaxTokens int           = 1024
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @Id       int,
+            @url      nvarchar(4000),
+            @headers  nvarchar(4000),
+            @cred     sysname,
+            @payload  nvarchar(max),
+            @response nvarchar(max),
+            @ret      int,
+            @http     int,
+            @odp      nvarchar(max),
+            @start    datetime2 = sysdatetime();
+
+    SET @Dostawca = LOWER(@Dostawca);
+
+    /* --- Różnice między dostawcami: URL, nagłówki, poświadczenie, model --- */
+    IF @Dostawca = 'claude'
+    BEGIN
+        SET @url     = N'https://api.anthropic.com/v1/messages';
+        SET @headers = N'{"anthropic-version":"2023-06-01","content-type":"application/json"}';
+        SET @cred    = N'https://api.anthropic.com';
+        SET @Model   = ISNULL(@Model, N'claude-sonnet-5-5');
+    END
+    ELSE IF @Dostawca = 'openai'
+    BEGIN
+        SET @url     = N'https://api.openai.com/v1/chat/completions';
+        SET @headers = N'{"content-type":"application/json"}';
+        SET @cred    = N'https://api.openai.com';
+        IF @Model IS NULL
+        BEGIN
+            RAISERROR(N'Dla OpenAI podaj nazwę modelu w parametrze @Model.', 16, 1);
+            RETURN;
+        END
+    END
+    ELSE
+    BEGIN
+        RAISERROR(N'Nieznany dostawca: %s. Dozwolone: claude, openai.', 16, 1, @Dostawca);
+        RETURN;
+    END;
+
+    /* --- Payload: tablica messages jest wspólna, różni się nazwa limitu tokenów --- */
+    IF @Dostawca = 'claude'
+        SET @payload = JSON_OBJECT(
+            'model'      : @Model,
+            'max_tokens' : @MaxTokens,
+            'messages'   : JSON_ARRAY(JSON_OBJECT('role':'user', 'content':@Pytanie)));
+    ELSE
+        SET @payload = JSON_OBJECT(
+            'model'                 : @Model,
+            'max_completion_tokens' : @MaxTokens,
+            'messages'              : JSON_ARRAY(JSON_OBJECT('role':'user', 'content':@Pytanie)));
+
+    /* --- Zapis pytania --- */
+    INSERT dbo.AIPytania (Dostawca, Model, Pytanie)
+    VALUES (@Dostawca, @Model, @Pytanie);
+    SET @Id = SCOPE_IDENTITY();
+
+    /* --- Wywołanie API --- */
+    BEGIN TRY
+        EXEC @ret = sp_invoke_external_rest_endpoint
+             @url        = @url,
+             @method     = 'POST',
+             @headers    = @headers,
+             @payload    = @payload,
+             @credential = @cred,
+             @timeout    = 230,
+             @response   = @response OUTPUT;
+
+        SET @http = JSON_VALUE(@response, '$.response.status.http.code');
+
+        /* --- Odczyt odpowiedzi: inna ścieżka JSON u każdego dostawcy --- */
+        IF @Dostawca = 'claude'
+            SELECT @odp = STRING_AGG([text], N'')
+            FROM OPENJSON(@response, '$.result.content')
+                 WITH ([type] nvarchar(50), [text] nvarchar(max))
+            WHERE [type] = 'text';
+        ELSE
+            SELECT TOP (1) @odp = content
+            FROM OPENJSON(@response, '$.result.choices')
+                 WITH (content nvarchar(max) '$.message.content');
+
+        UPDATE dbo.AIPytania
+        SET Odpowiedz       = @odp,
+            DataOdpowiedzi  = sysdatetime(),
+            CzasMs          = DATEDIFF(millisecond, @start, sysdatetime()),
+            KodHttp         = @http,
+            -- obaj dostawcy zwracają błąd w $.error.message
+            Blad            = CASE WHEN @http <> 200
+                                   THEN JSON_VALUE(@response, '$.result.error.message') END,
+            SurowaOdpowiedz = @response
+        WHERE Id = @Id;
+    END TRY
+    BEGIN CATCH
+        UPDATE dbo.AIPytania
+        SET Blad            = ERROR_MESSAGE(),
+            DataOdpowiedzi  = sysdatetime(),
+            CzasMs          = DATEDIFF(millisecond, @start, sysdatetime()),
+            SurowaOdpowiedz = @response
+        WHERE Id = @Id;
+    END CATCH;
+
+    SELECT Id, Dostawca, Model, Pytanie, Odpowiedz, CzasMs, KodHttp, Blad
+    FROM dbo.AIPytania
+    WHERE Id = @Id;
+END;
+GO
+
+/* ---------------------------------------------------------------------
+   4. Testy
+   --------------------------------------------------------------------- */
+DECLARE @p nvarchar(max) =
+    N'Czym jest index online w SQL Server 2025.';
+
+EXEC dbo.ZapytajAI @Pytanie = @p, @Dostawca = 'claude';
+EXEC dbo.ZapytajAI @Pytanie = @p, @Dostawca = 'openai', @Model = N'gpt-5.4-mini';
+
+-- Porównanie obu odpowiedzi na to samo pytanie
+SELECT Dostawca, Model, CzasMs, KodHttp, Odpowiedz, Blad
+FROM dbo.AIPytania
+WHERE Pytanie = @p
+ORDER BY Id DESC;
+GO
+
+truncate table AIPytania
