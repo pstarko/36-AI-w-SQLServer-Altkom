@@ -1,0 +1,135 @@
+/*
+Funkcja odległości wektorowej
+Aby określić, jak daleko od siebie znajdują się dwa wektory, możemy użyć metryki odległości, 
+metody lub wzoru do pomiaru różnicy między nimi.
+
+VECTOR_DISTANCE (distance_metric, vector1, vector2), gdzie distance_metric może być:
+
+    Cosinus: mierzy cosinus kąta między dwoma wektorami. Jest to miara orientacji, a nie wielkości. 
+                Oblicza się ją jako iloczyn skalarny wektorów podzielony przez iloczyn ich długości.
+    Euklidesowa: uzyskuje się ją jako pierwiastek kwadratowy z sumy (Ai-Bi) do kwadratu.
+    Skalarna: ujemny iloczyn skalarny oblicza się jako ujemny wynik sumy (Ai * Bi).
+*/
+
+DECLARE @A VECTOR(2) = '[1,1]';
+DECLARE @B VECTOR(2) = '[-1,-1]';
+ 
+SELECT   VECTOR_DISTANCE('euclidean', @A, @B) AS euclidean
+        ,VECTOR_DISTANCE('cosine', @A, @B) AS cosine
+        ,VECTOR_DISTANCE('dot', @A, @B) AS negative_dot_product;
+
+DECLARE @v AS VECTOR(3) = '[1,2,3]';
+ 
+SELECT   VECTORPROPERTY(@v, 'Dimensions')
+        ,VECTORPROPERTY(@v, 'BaseType');
+
+
+DECLARE @v AS VECTOR(3) = '[1,2,4.4]';
+ 
+SELECT   VECTORPROPERTY(@v, 'Dimensions')
+        ,VECTORPROPERTY(@v, 'BaseType');
+
+drop table przykladowe_wektory
+
+-- 1. Tworzymy tabelę z przykładowymi wektorami
+CREATE TABLE przykladowe_wektory (
+    id int PRIMARY KEY,
+    nazwa varchar(50),
+    wektor VECTOR(3)  -- 3-wymiarowe wektory dla łatwości zrozumienia
+);
+
+-- 2. Wstawiamy przykładowe dane (punkty w przestrzeni 3D)
+INSERT INTO przykladowe_wektory (id, nazwa, wektor) VALUES
+    (1, 'Punkt A', '[1, 2, 3]'),
+    (2, 'Punkt B', '[4, 5, 6]'),
+    (3, 'Punkt C', '[1, 2, 4]'),  -- bardzo podobny do A
+    (4, 'Punkt D', '[10, 20, 30]'), -- daleko od wszystkich
+    (5, 'Punkt E', '[1.1, 2.1, 3.1]'); -- bardzo blisko A
+
+-- 3. Sprawdźmy nasze dane
+SELECT * FROM przykladowe_wektory;
+
+
+-- 4. KLUCZOWY PRZYKŁAD: Obliczamy odległości euklidesowe od Punktu A
+SELECT
+  p.nazwa,
+  p.wektor,
+  VECTOR_DISTANCE('euclidean', p.wektor, CAST('[1,2,3]' AS VECTOR(3))) odleglosc_od_A
+FROM przykladowe_wektory p
+ORDER BY odleglosc_od_A
+
+select
+    t1.val,
+    CUME_DIST() over (order by t1.val)
+    from (
+            select 10 val
+            union all
+            select 20
+            union all
+            select 30
+            union all
+            select 60 ) t1
+
+
+-- 5. Znajdźmy 3 najbliższe punkty do Punktu A
+SELECT 
+    top 3 nazwa,
+    wektor,
+    VECTOR_DISTANCE('euclidean', wektor, CAST('[1,2,3]' AS VECTOR(3))) AS odleglosc
+FROM przykladowe_wektory
+WHERE nazwa not in ('Punkt A')  -- wykluczamy sam punkt A
+ORDER BY odleglosc
+
+-- 6. Przykład z indeksem dla wydajności (dla większych zbiorów danych)
+-- W SQL Server 2025 RTM indeksy wektorowe są funkcją preview i wymagają najpierw włączenia.
+/*
+    Indeks wymaga minimum 100 wierszy z niepustymi wektorami. 
+    Przy mniejszych zbiorach VECTOR_DISTANCE bez indeksu działa poprawnie.
+*/
+
+ALTER DATABASE SCOPED CONFIGURATION SET PREVIEW_FEATURES = ON;
+
+CREATE VECTOR INDEX idx_wektor
+ON przykladowe_wektory (wektor)
+WITH (METRIC = 'EUCLIDEAN')
+
+--Po założeniu indeksu lepiej używać VECTOR_SEARCH:
+
+DECLARE @qv VECTOR(3) = '[1,2,3]';
+
+SELECT t.nazwa, t.wektor, s.distance AS odleglosc
+FROM VECTOR_SEARCH(
+    TABLE = przykladowe_wektory AS t,
+    COLUMN = wektor,
+    SIMILAR_TO = @qv,
+    METRIC = 'euclidean',
+    TOP_N = 3
+) AS s
+ORDER BY s.distance
+
+exec sp_spaceused 'przykladowe_wektory'
+
+
+--7.  PRAKTYCZNY PRZYKŁAD: Symulacja wyszukiwania podobnych dokumentów
+-- Załóżmy, że mamy osadzenia tekstów (embeddings)
+CREATE TABLE  dokumenty (
+    id int PRIMARY KEY,
+    tytul varchar(50),
+    embedding VECTOR(5)  -- uproszczone 5-wymiarowe osadzenie
+);
+
+INSERT INTO dokumenty (id, tytul, embedding) VALUES
+    (1, 'Artykuł o kotach', '[0.8, 0.2, 0.1, 0.9, 0.3]'),
+    (2, 'Tekst o psach', '[0.7, 0.3, 0.2, 0.8, 0.4]'),
+    (3, 'Artykuł o samochodach', '[0.1, 0.9, 0.8, 0.2, 0.7]'),
+    (4, 'Tekst o kotach domowych', '[0.85, 0.15, 0.05, 0.95, 0.25]'),
+    (5, 'Artykuł o motorach', '[0.2, 0.8, 0.9, 0.1, 0.8]');
+
+
+-- Znajdźmy dokumenty podobne do zapytania o "koty"
+-- (reprezentowanego przez wektor [0.8, 0.2, 0.1, 0.9, 0.3])
+SELECT 
+    tytul,
+    VECTOR_DISTANCE('euclidean', embedding, CAST('[0.8, 0.2, 0.1, 0.9, 0.3]' AS VECTOR(5))) odleglosc
+FROM dokumenty
+ORDER BY odleglosc
