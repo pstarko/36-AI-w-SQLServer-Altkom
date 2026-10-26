@@ -1,0 +1,107 @@
+--LLM API
+
+/*
+Do tego służy procedura sp_invoke_external_rest_endpoint. 
+
+*/
+
+-- Włączenie wywołań REST (SQL Server 2025 / Managed Instance)
+EXECUTE sp_configure 'external rest endpoint enabled', 1;
+RECONFIGURE WITH OVERRIDE;
+GO
+
+-- Klucz API trzymany w poświadczeniu, a nie w kodzie procedury
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'SilneHasloDoMasterKey!123';
+GO
+CREATE DATABASE SCOPED CREDENTIAL [https://api.anthropic.com]
+WITH IDENTITY = 'HTTPEndpointHeaders',
+     SECRET   = '{"x-api-key":"sk - WASZ KLUCZ"}';
+GO
+
+
+CREATE TABLE dbo.ClaudePytania
+(
+    Id              int IDENTITY PRIMARY KEY,
+    Pytanie         nvarchar(max) NOT NULL,
+    Odpowiedz       nvarchar(max) NULL,
+    DataPytania     datetime2     NOT NULL DEFAULT sysdatetime(),
+    DataOdpowiedzi  datetime2     NULL,
+    KodHttp         int           NULL,
+    Blad            nvarchar(max) NULL
+);
+
+GO
+
+
+CREATE OR ALTER PROCEDURE dbo.ZapytajClaude
+    @Pytanie   nvarchar(max),
+    @Model     nvarchar(100) = N'claude-sonnet-5-5',
+    @MaxTokens int = 1024
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @Id int, @payload nvarchar(max), @response nvarchar(max),
+            @ret int, @http int, @odp nvarchar(max);
+
+    -- 1. Zapis pytania
+    INSERT dbo.ClaudePytania (Pytanie) VALUES (@Pytanie);
+    SET @Id = SCOPE_IDENTITY();
+
+    -- 2. Budowa JSON (JSON_OBJECT poprawnie escapuje cudzysłowy i znaki nowej linii)
+    SET @payload = JSON_OBJECT(
+        'model'      : @Model,
+        'max_tokens' : @MaxTokens,
+        'messages'   : JSON_ARRAY(
+                          JSON_OBJECT('role':'user', 'content':@Pytanie)));
+
+    -- 3. Wywołanie API
+    BEGIN TRY
+        EXEC @ret = sp_invoke_external_rest_endpoint
+             @url        = N'https://api.anthropic.com/v1/messages',
+             @method     = 'POST',
+             @headers    = N'{"anthropic-version":"2023-06-01","content-type":"application/json"}',
+             @payload    = @payload,
+             @credential = [https://api.anthropic.com],
+             @timeout    = 230,
+             @response   = @response OUTPUT;
+
+        SET @http = JSON_VALUE(@response, '$.response.status.http.code');
+        SET @odp  = JSON_VALUE(@response, '$.result.content[0].text');
+
+        -- JSON_VALUE ucina tekst powyżej 4000 znaków, dlatego dla długich odpowiedzi OPENJSON:
+        SELECT @odp = [text]
+        FROM OPENJSON(@response, '$.result.content')
+             WITH ([type] nvarchar(50), [text] nvarchar(max))
+        WHERE [type] = 'text';
+
+     -- 4. Zapis odpowiedzi
+        UPDATE dbo.ClaudePytania
+        SET Odpowiedz      = @odp,
+            DataOdpowiedzi = sysdatetime(),
+            KodHttp        = @http,
+            Blad           = CASE WHEN @http <> 200 THEN @response END
+        WHERE Id = @Id;
+    END TRY
+    BEGIN CATCH
+        UPDATE dbo.ClaudePytania
+        SET Blad = ERROR_MESSAGE(), DataOdpowiedzi = sysdatetime()
+        WHERE Id = @Id;
+    END CATCH;
+
+    SELECT Id, Pytanie, Odpowiedz, KodHttp, Blad
+    FROM dbo.ClaudePytania WHERE Id = @Id;
+END;
+GO
+
+-- Test
+EXEC dbo.ZapytajClaude N'Wyjaśnij w 3 zdaniach, czym różni się indeks klastrowy od nieklastrowego w SQL Server.';
+
+select * from ClaudePytania
+
+-- Test
+EXEC dbo.ZapytajClaude N'Jakie miasto jest największe pod względem ludności w Hiszpanii';
+
+
+
+
