@@ -1,0 +1,81 @@
+SELECT   VECTOR_DISTANCE('euclidean', @A, @B) AS euclidean
+        ,VECTOR_DISTANCE('cosine', @A, @B) AS cosine
+        ,VECTOR_DISTANCE('dot', @A, @B) AS negative_dot_product;
+
+
+--metryka cosinusowa
+
+/*
+Kluczowe punkty z przykładu:
+	1. Operatory w pgvector:
+
+		VECTOR_DISTANCE('cosine', @A, @B) - odległość kosinusowa (im mniejsza, tym większe podobieństwo)
+		VECTOR_DISTANCE('euclidean', @A, @B) - odległość euklidesowa
+		Podobieństwo kosinusowe = 1 - odległość kosinusowa
+		
+2. Praktyczny przykład:
+	Tabela produkty zawiera wektory 3D reprezentujące cechy: [cena, jakość, popularność]
+
+3. Różnica między metrykami:
+	W przykładzie zobaczysz, że wektory [1,1,1] i [2,2,2] mają:
+
+	Podobieństwo kosinusowe = 1.0 (identyczny kierunek)
+	Odległość euklidesową = 1.73 (różne długości)
+	
+4. Zastosowanie praktyczne:
+Gdy szukasz produktu o cechach [0.85, 0.8, 0.6] (drogi, wysokiej jakości, średnio popularny), 
+metryka cosinusowa znajdzie produkty o podobnym "profilu", niezależnie od tego, jak "intensywne" są te cechy.
+*/
+
+-- 1. Tworzymy tabelę z przykładowymi produktami i ich wektorami cech
+CREATE TABLE produkty (
+    id int PRIMARY KEY,
+    nazwa varchar(50),
+    opis varchar(50),
+    cechy_vector VECTOR(3)  -- 3-wymiarowy wektor dla prostoty
+);
+
+-- 2. Wstawiamy przykładowe dane
+-- Każdy wektor reprezentuje cechy produktu: [cena, jakość, popularność]
+INSERT INTO produkty (id, nazwa, opis, cechy_vector) VALUES
+    (1, 'Laptop Gaming', 'Wysokiej klasy laptop do gier', '[0.9, 0.8, 0.7]'),
+    (2, 'Laptop Biurowy', 'Podstawowy laptop do pracy', '[0.3, 0.6, 0.8]'),
+    (3, 'Laptop Premium', 'Drogi laptop biznesowy', '[0.95, 0.9, 0.6]'),
+    (4, 'Tablet Podstawowy', 'Tani tablet do internetu', '[0.2, 0.4, 0.9]'),
+    (5, 'Tablet Pro', 'Profesjonalny tablet graficzny', '[0.8, 0.85, 0.5]');
+
+
+-- 3. Przykład wyszukiwania z metryką cosinusową
+-- Szukamy produktów podobnych do wektora zapytania [0.85, 0.8, 0.6]
+-- (reprezentuje: wysoka cena, wysoka jakość, średnia popularność)
+
+set statistics io on
+
+SELECT 
+    nazwa,
+    opis,
+    cechy_vector,
+    -- Obliczamy podobieństwo kosinusowe (1 - cosine distance)
+    1 - (VECTOR_DISTANCE('cosine', cechy_vector, CAST('[0.85, 0.8, 0.6]' AS VECTOR(3)))) as podobienstwo_kosinusowe,
+    -- Dla porównania - odległość euklidesowa
+    VECTOR_DISTANCE('euclidean', cechy_vector, CAST('[0.85, 0.8, 0.6]' AS VECTOR(3))) AS odleglosc_euklidesowa
+FROM produkty
+ORDER BY podobienstwo_kosinusowe desc
+
+-- 4. Przykład pokazujący różnicę między metrykami
+-- Porównajmy dwa wektory o tym samym kierunku ale różnej długości
+SELECT 
+    'Wektor A: [1, 1, 1]' as wektor,
+    1 - VECTOR_DISTANCE('cosine', CAST('[1, 1, 1]' AS VECTOR(3)), CAST('[2, 2, 2]' AS VECTOR(3))) podobienstwo_kosinusowe,
+    VECTOR_DISTANCE('euclidean', CAST('[1, 1, 1]' AS VECTOR(3)), CAST('[2, 2, 2]' AS VECTOR(3)))  odleglosc_euklidesowa
+UNION ALL
+SELECT 
+    'Wektor B: [1, 0, 0]' as wektor,
+    1 - VECTOR_DISTANCE('cosine', CAST('[1, 1, 1]' AS VECTOR(3)), CAST('[1, 0, 0]' AS VECTOR(3))) podobienstwo_kosinusowe,
+    VECTOR_DISTANCE('euclidean', CAST('[1, 1, 1]' AS VECTOR(3)), CAST('[1, 0, 0]' AS VECTOR(3)))  odleglosc_euklidesowa
+
+
+
+
+
+
