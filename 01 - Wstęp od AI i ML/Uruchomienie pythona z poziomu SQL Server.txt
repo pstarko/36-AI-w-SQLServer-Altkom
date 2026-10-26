@@ -1,0 +1,132 @@
+-- Tworzenie tabeli z historycznymi danymi sprzedaży
+CREATE TABLE SalesHistory (
+    SaleID INT IDENTITY(1,1) PRIMARY KEY,
+    ProductID INT NOT NULL,
+    SaleDate DATE NOT NULL,
+    Quantity INT NOT NULL,
+    Revenue DECIMAL(10,2) NOT NULL
+);
+
+-- Przykładowe dane (symulacja sprzedaży)
+INSERT INTO SalesHistory (ProductID, SaleDate, Quantity, Revenue)
+VALUES 
+    (1, '2023-01-15', 120, 2400.00),
+    (1, '2023-02-10', 135, 2700.00),
+    (1, '2023-03-05', 150, 3000.00),
+    (1, '2023-04-20', 140, 2800.00),
+    (1, '2023-05-12', 160, 3200.00),
+    (1, '2023-06-08', 180, 3600.00),
+    (1, '2023-07-15', 200, 4000.00),
+    (1, '2023-08-22', 190, 3800.00),
+    (1, '2023-09-10', 170, 3400.00),
+    (1, '2023-10-05', 155, 3100.00),
+    (1, '2023-11-18', 145, 2900.00),
+    (1, '2023-12-20', 165, 3300.00),
+    (2, '2023-01-10', 80, 1600.00),
+    (2, '2023-02-15', 90, 1800.00),
+    (2, '2023-03-20', 95, 1900.00);
+
+select * from SalesHistory
+
+CREATE VIEW MonthlySales AS
+SELECT 
+    ProductID,
+    YEAR(SaleDate) AS Year,
+    MONTH(SaleDate) AS Month,
+    SUM(Quantity) AS TotalQuantity,
+    SUM(Revenue) AS TotalRevenue
+FROM SalesHistory
+GROUP BY ProductID, YEAR(SaleDate), MONTH(SaleDate);
+go
+
+
+EXEC sp_execute_external_script 
+    @language = N'Python',
+    @script = N'print(123)';
+
+-- Włączenie Machine Learning Services (jeśli jeszcze nie jest włączone)
+EXEC sp_configure 'external scripts enabled', 1;
+RECONFIGURE;
+GO
+
+-- Procedura składowana z modelem prognozowania
+CREATE OR ALTER PROCEDURE PredictSales
+    @ProductID INT,
+    @ForecastMonths INT = 3
+AS
+BEGIN
+    EXEC sp_execute_external_script
+        @language = N'Python',
+        @script = N'
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+
+df = InputDataSet
+
+if df.empty:
+    # zawsze zwróć chociaż pustą ramkę danych o poprawnych kolumnach
+    OutputDataSet = pd.DataFrame(columns=["ForecastMonth", "PredictedQuantity"])
+else:
+    # X = kolumna z indeksami miesięcy
+    X = df[["MonthIndex"]].values
+    y = df["TotalQuantity"].values
+
+    model = LinearRegression().fit(X, y)
+
+    # kolejne miesiące do prognozy
+    last_idx = df["MonthIndex"].max()
+    future_idx = np.arange(last_idx + 1, last_idx + 1 + forecast_months).reshape(-1, 1)
+
+    predictions = model.predict(future_idx)
+
+    result = pd.DataFrame({
+        "ForecastMonth": np.arange(1, forecast_months + 1, dtype=int),
+        "PredictedQuantity": predictions.astype(int)
+    })
+    OutputDataSet = result
+',
+        @input_data_1 = N'
+            SELECT MonthIndex = ROW_NUMBER() OVER (ORDER BY Year, Month),
+                   TotalQuantity
+            FROM MonthlySales
+            WHERE ProductID = @ProductID
+            ORDER BY Year, Month
+        ',
+        @params = N'@ProductID INT, @forecast_months INT',
+        @ProductID = @ProductID,
+        @forecast_months = @ForecastMonths
+    WITH RESULT SETS ((ForecastMonth INT, PredictedQuantity INT));
+END;
+GO
+
+--Uruchamianie prognozy
+-- Prognoza sprzedaży dla produktu ID=1 na następne 3 miesiące
+EXEC PredictSales @ProductID = 1, @ForecastMonths = 3;
+
+/*
+1	179
+2	182
+3	185
+
+po zaniżeniu sprzedaży:
+
+1	128
+2	126
+3	125
+*/
+-- Dodajemy kolejne dane -> zaniżamy sprzedaż
+INSERT INTO SalesHistory (ProductID, SaleDate, Quantity, Revenue)
+VALUES 
+    (1, '2024-01-16', 100, 2000.00),
+    (1, '2024-02-11', 115, 2500.00),
+    (1, '2024-03-04', 150, 3000.00),
+    (1, '2024-04-10', 140, 2800.00),
+    (1, '2024-05-11', 160, 3200.00),
+    (1, '2024-06-02', 180, 3600.00),
+    (1, '2024-07-14', 100, 2000.00),
+    (1, '2024-08-22',  90, 1800.00),
+    (1, '2024-09-10', 120, 2500.00),
+    (1, '2024-10-03', 155, 3100.00),
+    (1, '2024-11-11', 145, 2900.00),
+    (1, '2024-12-21', 115, 2100.00)
