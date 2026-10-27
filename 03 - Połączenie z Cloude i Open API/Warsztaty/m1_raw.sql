@@ -42,3 +42,45 @@ EXEC @Ret = sys.sp_invoke_external_rest_endpoint
 -- tekst:   $.result.output[?type=message].content[?type=output_text].text
 -- tokeny:  $.result.usage.input_tokens, $.result.usage.output_tokens
 */
+
+
+--WERSJA OPEN AI
+DECLARE @pytanie   NVARCHAR(MAX) = N'Ile mieszkańców ma Gdańsk';
+DECLARE @payload   NVARCHAR(MAX);
+DECLARE @response  NVARCHAR(MAX);
+DECLARE @ret       INT;
+
+-- Budowa JSON-a (JSON_OBJECT sam escapuje cudzysłowy i znaki specjalne)
+SET @payload = JSON_OBJECT(
+    'model': 'gpt-4o-mini',
+    'temperature': 0.2,
+    'messages': JSON_ARRAY(
+        --JSON_OBJECT('role':'system', 'content':'Jesteś ekspertem SQL Server. Odpowiadasz po polsku.'),
+        JSON_OBJECT('role':'user',   'content':@pytanie)
+    )
+);
+
+EXEC @ret = sp_invoke_external_rest_endpoint
+     @url        = N'https://api.openai.com/v1/chat/completions',
+     @method     = 'POST',
+     @headers    = N'{"Content-Type":"application/json"}',
+     @credential = [https://api.openai.com],
+     @payload    = @payload,
+     @timeout    = 60,
+     @response   = @response OUTPUT;
+
+-- 1) Surowa odpowiedź (do podglądu struktury)
+SELECT @ret AS return_code, @response AS surowy_json;
+
+-- 2) Wyciągnięte, czytelne pola
+SELECT
+    JSON_VALUE(@response, '$.response.status.http.code')          AS http_status,
+    JSON_VALUE(@response, '$.result.model')                       AS model,
+    JSON_VALUE(@response, '$.result.choices[0].message.content')  AS odpowiedz,
+    JSON_VALUE(@response, '$.result.usage.prompt_tokens')         AS tokeny_prompt,
+    JSON_VALUE(@response, '$.result.usage.completion_tokens')     AS tokeny_odpowiedz,
+    JSON_VALUE(@response, '$.result.error.message')               AS blad;   -- NULL, jeśli OK
+
+-- 3) Wersja "na ekran" w zakładce Messages
+DECLARE @odp NVARCHAR(MAX) = JSON_VALUE(@response, '$.result.choices[0].message.content');
+PRINT @odp;
