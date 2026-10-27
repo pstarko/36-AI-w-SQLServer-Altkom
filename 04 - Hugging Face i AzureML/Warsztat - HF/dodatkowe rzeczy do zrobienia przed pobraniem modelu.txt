@@ -1,6 +1,7 @@
 --Instalacja biblioteki
 python -m pip install -U huggingface_hub
 python -m pip install -U transformers
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 --Pobranie modelu w CMD
 hf download distilbert/distilbert-base-uncased-finetuned-sst-2-english `  config.json tokenizer_config.json vocab.txt model.safetensors `  --local-dir C:\ProgramData\HF_MODELS\distilbert
