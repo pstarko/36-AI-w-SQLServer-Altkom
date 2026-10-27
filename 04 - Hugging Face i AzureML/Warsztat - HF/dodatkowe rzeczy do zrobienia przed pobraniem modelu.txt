@@ -1,0 +1,10 @@
+--Instalacja biblioteki
+python -m pip install -U huggingface_hub
+
+--Pobranie modelu w CMD
+hf download distilbert/distilbert-base-uncased-finetuned-sst-2-english `  config.json tokenizer_config.json vocab.txt model.safetensors `  --local-dir C:\ProgramData\HF_MODELS\distilbert
+
+
+
+icacls "C:\ProgramData\HF_MODELS" /grant "*S-1-15-2-1:(OI)(CI)RX" /T
+icacls "C:\ProgramData\HF_MODELS" /grant "SQLRUserGroupNAZWAINSTANCJI:(OI)(CI)RX" /T
