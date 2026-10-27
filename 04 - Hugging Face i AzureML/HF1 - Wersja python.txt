@@ -1,0 +1,54 @@
+import pyodbc
+from transformers import pipeline
+
+# Połączenie z SQL Server (dopasuj parametry do swojej instancji)
+conn_str = (
+    "DRIVER={ODBC Driver 17 for SQL Server};"
+    "SERVER=STARKOGABINET\SQLSERVER2025;"   # lub "NAZWA_SERWERA\INSTANCJA"
+    "DATABASE=HF2;"
+    "UID=python;"      
+    "PWD=oracle123;"              # hasło do SQL Server
+)
+conn = pyodbc.connect(conn_str)
+cursor = conn.cursor()
+
+# Stwórz tabelę (jeśli nie istnieje) – składnia dla SQL Server
+cursor.execute("""
+IF NOT EXISTS (SELECT * FROM sys.objects 
+               WHERE object_id = OBJECT_ID(N'predictions') 
+               AND type in (N'U'))
+BEGIN
+    CREATE TABLE predictions (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        text NVARCHAR(MAX),
+        sentiment VARCHAR(50),
+        score FLOAT,
+        created_at DATETIME DEFAULT GETDATE()
+    )
+END
+""")
+conn.commit()
+
+# Model z Hugging Face — checkpoint DistilBERT SST-2
+classifier = pipeline(
+    "sentiment-analysis",
+    model="distilbert/distilbert-base-uncased-finetuned-sst-2-english"
+)
+
+# Przykładowe dane
+texts = [
+    "quite difficult to maintain",
+    "it's visually stunning."
+]
+
+# Analiza i zapis do bazy
+for text in texts:
+    result = classifier(text)[0]
+    cursor.execute(
+        "INSERT INTO predictions (text, sentiment, score) VALUES (?, ?, ?)",
+        (text, result["label"], float(result["score"]))
+    )
+
+conn.commit()
+cursor.close()
+conn.close()
