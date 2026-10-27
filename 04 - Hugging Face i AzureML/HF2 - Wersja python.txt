@@ -1,0 +1,137 @@
+import pyodbc
+import json
+from transformers import AutoTokenizer, AutoModel
+import torch
+
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+VECTOR_DIM = 384          # wymiar embeddingów modelu all-MiniLM-L6-v2
+ONLY_MISSING = False      # True = licz embeddingi tylko dla wierszy, gdzie embedding IS NULL
+INSERT_SAMPLE_DATA = True # wstaw przykładowe artykuły, jeśli tabela została właśnie utworzona
+
+# Połączenie z SQL Server 2025 – dopasuj parametry do swojej instancji.
+# ODBC Driver 18 jest zalecany dla SQL Server 2025 (domyślnie Encrypt=yes,
+# stąd TrustServerCertificate=yes dla lokalnej instancji z certyfikatem self-signed).
+CONN_STR = (
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    r"SERVER=STARKOGABINET\SQLSERVER2025;"
+    "DATABASE=HF2;"
+    "UID=python;"
+    "PWD=oracle123;"
+    # "Trusted_Connection=yes;"   # zamiast UID/PWD przy uwierzytelnianiu Windows
+    "TrustServerCertificate=yes;"
+)
+
+SAMPLE_ARTICLES = [
+    "SQL Server 2025 wprowadza natywny typ danych VECTOR do przechowywania embeddingów.",
+    "Indeksy kolumnowe przyspieszają zapytania analityczne na dużych tabelach faktów.",
+    "Kopie zapasowe bazy danych należy regularnie testować przez odtworzenie na innym serwerze.",
+    "Wyszukiwanie semantyczne porównuje znaczenie tekstów, a nie tylko wspólne słowa.",
+    "Python z biblioteką pyodbc pozwala łatwo łączyć się z bazą SQL Server.",
+]
+
+
+def ensure_table(cursor) -> bool:
+    """Tworzy tabelę articles, jeśli nie istnieje. Zwraca True, gdy tabela została utworzona."""
+    cursor.execute("SELECT OBJECT_ID(N'dbo.articles', N'U')")
+    if cursor.fetchone()[0] is None:
+        cursor.execute(f"""
+            CREATE TABLE dbo.articles (
+                id         INT IDENTITY(1,1) PRIMARY KEY,
+                text       NVARCHAR(MAX) NOT NULL,
+                embedding  VECTOR({VECTOR_DIM}) NULL
+            )
+        """)
+        print("Utworzono tabelę dbo.articles.")
+        return True
+
+    # Tabela istnieje – sprawdź kolumnę embedding
+    cursor.execute("""
+        SELECT t.name
+        FROM sys.columns c
+        JOIN sys.types t ON c.user_type_id = t.user_type_id
+        WHERE c.object_id = OBJECT_ID(N'dbo.articles') AND c.name = N'embedding'
+    """)
+    col = cursor.fetchone()
+    if col is None:
+        cursor.execute(f"ALTER TABLE dbo.articles ADD embedding VECTOR({VECTOR_DIM}) NULL")
+        print(f"Dodano kolumnę embedding VECTOR({VECTOR_DIM}).")
+    elif col[0].lower() != "vector":
+        raise RuntimeError(
+            f"Kolumna embedding ma typ {col[0]}, a nie VECTOR. "
+            "Usuń ją lub zmień nazwę (np. stary format JSON w NVARCHAR) i uruchom skrypt ponownie."
+        )
+    return False
+
+
+def embed(text, tokenizer, model):
+    """Zwraca znormalizowany embedding (mean pooling z maską uwagi)."""
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+    with torch.no_grad():
+        token_embeddings = model(**inputs).last_hidden_state
+    mask = inputs["attention_mask"].unsqueeze(-1).float()
+    emb = (token_embeddings * mask).sum(dim=1) / mask.sum(dim=1)
+    emb = torch.nn.functional.normalize(emb, p=2, dim=1)  # przydatne dla odległości cosinusowej
+    return emb[0].tolist()
+
+
+def main():
+    conn = None
+    cursor = None
+    try:
+        conn = pyodbc.connect(CONN_STR)
+        cursor = conn.cursor()
+
+        created = ensure_table(cursor)
+        if created and INSERT_SAMPLE_DATA:
+            cursor.executemany(
+                "INSERT INTO dbo.articles (text) VALUES (?)",
+                [(t,) for t in SAMPLE_ARTICLES],
+            )
+            print(f"Wstawiono {len(SAMPLE_ARTICLES)} przykładowych artykułów.")
+        conn.commit()
+
+        query = "SELECT id, text FROM dbo.articles"
+        if ONLY_MISSING:
+            query += " WHERE embedding IS NULL"
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        if not rows:
+            print("Brak danych do przetworzenia w tabeli articles.")
+            return
+
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        model = AutoModel.from_pretrained(MODEL_NAME)
+        model.eval()
+
+        updated = 0
+        for row_id, text in rows:
+            embedding_list = embed(text, tokenizer, model)  # 384 floaty
+
+            # SQL Server 2025: natywny typ VECTOR. Wektor przekazujemy jako tablicę JSON
+            # i jawnie rzutujemy na VECTOR(384) – serwer sprawdzi też wymiar.
+            # Uwaga: pyodbc wysyła napisy > 4000 znaków jako ntext, którego nie da się
+            # rzutować na VECTOR – stąd pośredni CAST na NVARCHAR(MAX).
+            cursor.execute(
+                f"UPDATE dbo.articles "
+                f"SET embedding = CAST(CAST(? AS NVARCHAR(MAX)) AS VECTOR({VECTOR_DIM})) "
+                f"WHERE id = ?",
+                (json.dumps(embedding_list), row_id),
+            )
+            updated += cursor.rowcount
+
+        conn.commit()
+        print(f"Zaktualizowano rekordów: {updated}")
+
+    except Exception as e:
+        if conn is not None:
+            conn.rollback()
+        print(f"Błąd podczas zapisu embeddingów: {e}")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+
+if __name__ == "__main__":
+    main()
