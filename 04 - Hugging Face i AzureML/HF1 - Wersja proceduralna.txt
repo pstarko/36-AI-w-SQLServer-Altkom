@@ -1,0 +1,119 @@
+--Sprawdzenie co widzi python z poziomu SQL Server (https://huggingface.co/distilbert/distilbert-base-uncased-finetuned-sst-2-english)
+
+EXEC sp_execute_external_script
+    @language = N'Python',
+    @script   = N'
+import os
+import pandas as pd
+
+path = r"C:\ProgramData\HF_MODELS\distilbert"
+OutputDataSet = pd.DataFrame({
+    "exists": [os.path.exists(path)],
+    "files":  [str(os.listdir(path) if os.path.exists(path) else "BRAK")]
+})
+';
+
+--------------
+
+
+drop table predictions
+
+-- 1. Utwórz tabelę (jednorazowo)
+IF NOT EXISTS (
+    SELECT * FROM sys.objects 
+    WHERE object_id = OBJECT_ID(N'predictions') AND type = N'U'
+)
+BEGIN
+    CREATE TABLE predictions (
+        id          INT IDENTITY(1,1) PRIMARY KEY,
+        text        NVARCHAR(MAX),
+        sentiment   VARCHAR(50),
+        score       FLOAT,
+        created_at  DATETIME DEFAULT GETDATE()
+    );
+END;
+GO
+
+-- 2. Procedura
+CREATE OR ALTER PROCEDURE dbo.usp_AnalyzeSentiment
+    @texts NVARCHAR(MAX)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @python_script NVARCHAR(MAX) = N'
+import os
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+# Ścieżka, którą AppContainer już widzi
+MODEL_PATH = r"C:\ProgramData\HF_MODELS\distilbert"
+
+# Wymuszenie trybu offline i braku symlinków
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+
+# Ładowanie modelu i tokenizera bezpośrednio z dysku
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
+model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH, local_files_only=True)
+model.eval()
+
+# Mapa etykiet z konfiguracji modelu
+id2label = model.config.id2label
+
+# Pobranie danych wejściowych
+texts = InputDataSet["text"].tolist()
+
+results = []
+for text in texts:
+    if text and text.strip():
+        # Tokenizacja i inferencja
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits
+        
+        probs = F.softmax(logits, dim=-1)
+        label_id = torch.argmax(probs).item()
+        score = probs[0][label_id].item()
+        
+        results.append({
+            "text": text,
+            "sentiment": id2label[label_id],
+            "score": float(score)
+        })
+
+# Przekazanie wyników z powrotem do SQL Server
+OutputDataSet = pd.DataFrame(results)
+';
+
+    -- Przygotowanie tabeli tymczasowej z tekstami
+    DROP TABLE IF EXISTS #InputTexts;
+    CREATE TABLE #InputTexts (text NVARCHAR(MAX));
+
+    INSERT INTO #InputTexts (text)
+    SELECT LTRIM(RTRIM(value))
+    FROM STRING_SPLIT(@texts, '|')
+    WHERE LTRIM(RTRIM(value)) <> '';
+
+    -- Wykonanie skryptu i zapisanie wyników do tabeli docelowej
+    INSERT INTO predictions (text, sentiment, score)
+    EXEC sp_execute_external_script
+        @language = N'Python',
+        @script = @python_script,
+        @input_data_1 = N'SELECT text FROM #InputTexts',
+        @input_data_1_name = N'InputDataSet';
+
+END;
+GO
+
+-- Przekaż teksty oddzielone |
+EXEC dbo.usp_AnalyzeSentiment 
+    @texts = N'I like this product!|I hate this product.|This is amazing!';
+
+-- Sprawdź wyniki
+SELECT * FROM predictions ORDER BY created_at DESC;
+
+
